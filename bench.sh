@@ -13,7 +13,7 @@ printf '|---|---:|---:|---:|---:|---:|\n'
 for fam in ${FAMILIES:-polya hier identity binary}; do
   for spec in 1000:2000 2000:1000 10000:500 100000:100 1000000:20 10000000:3; do
     n=${spec%%:*}; c=${spec##*:}
-    line=$(./polyagen --family $fam -n $n --count $c --seed 2024 --format none --stats 2>&1 | grep '^# MEAN family')
+    line=$(./polyagen --family $fam -n $n --count $c --seed 2026 --format none --stats 2>&1 | grep '^# MEAN family')
     t=$(echo "$line" | get time); r=$(echo "$line" | sed -n 's/.*steps\/(n ln n)=\([0-9.]*\).*/\1/p'); p=$(echo "$line" | get precomputation)
     printf '| %s | %s | %s | %s | %s | %s |\n' $fam $n $c $t $r $p
   done
