@@ -13,6 +13,12 @@ size `n`, in one of the following five families:
 | `binary`   | non-plane binary trees (0 or 2 children per node), Wedderburn–Etherington numbers | number of leaves    | A001190 |
 | `ubinary`  | unrooted binary trees (internal nodes of degree 3)      | number of leaves (`n ≥ 2`) | A129860 |
 
+
+(C) A. Genitrini under the GNU Public license v.3 (cf. LICENSE.txt)
+
+
+
+
 This code accompanies the paper
 
 > Antoine Genitrini, *Smooth disturbances of tree functions: full asymptotic
