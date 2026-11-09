@@ -38,6 +38,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  * C99, no dependency other than libm.
  */
+
 #define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
@@ -731,12 +732,12 @@ static inline int64_t choose_binary(const tables_t *T, rng_t *rng, int64_t m, ui
  * (A != B) is reached via d = |A| and d = |B|, with total weight
  * |A| + |B| = m; a tree {A,A} via d = m/2 and via the decoration, with
  * total weight m; hence the probability m / (m T_m) = 1/T_m. */
-static void gen_binary(sampler_t *S, const tables_t *T, int64_t n)
+static int64_t gen_binary_at(sampler_t *S, const tables_t *T, int64_t n, int64_t start)
 {
     int32_t *sz = S->sz;
-    int64_t top = 0, sp = 0;
+    int64_t top = start, sp = 0;
     int64_t root = top++;
-    if (n == 1) { sz[root] = 1; S->top = top; return; }
+    if (n == 1) { sz[root] = 1; return top; }
     S->bs[sp++] = (bframe){ root, n, 0, 0, 0 };
     while (sp > 0) {
         if (sp == S->bscap) {
@@ -768,7 +769,139 @@ static void gen_binary(sampler_t *S, const tables_t *T, int64_t n)
         if (c == 1) sz[pos] = 1;
         else S->bs[sp++] = (bframe){ pos, c, 0, 0, 0 };
     }
-    S->top = top;
+    return top;
+}
+static void gen_binary(sampler_t *S, const tables_t *T, int64_t n) { S->top = gen_binary_at(S, T, n, 0); }
+
+/* ------------------------------------------------------------------------
+ * Unrooted binary trees (OEIS A129860), size = number of leaves n >= 2.
+ * Leaf centroid: either an internal node whose three branches have less
+ * than n/2 leaves each (multiset of three rooted binary trees of sizes
+ * < n/2, total n), or, for n even, an edge splitting the leaves into two
+ * halves (multiset of two rooted binary trees of size n/2). Multisets are
+ * drawn with the cycle index of S_3 (resp. S_2): a pair (sigma, sequence
+ * fixed by sigma) is drawn uniformly, which makes the multiset uniform
+ * (Burnside). Weights are scaled by rho^n, as the tables w_k = rho^k T_k.
+ * Output: tree rooted at the centroid node, or at an endpoint of the
+ * centroid edge; 2n-2 nodes, internal nodes of (unrooted) degree 3.
+ * The exact weights M(a) = w_a Q(n-a) of the ordered triples require an
+ * O(n^2) precomputation, done once for all the samples of size n.
+ * ---------------------------------------------------------------------- */
+typedef struct {
+    int64_t n, h;          /* h = largest integer < n/2 */
+    double *M;             /* M[a] = w_a * Q(n-a), 1 <= a <= h */
+    double zid, ztr, zcyc, zuni, zbi_id, zbi_dup;
+} ubin_t;
+
+static void ubin_build(ubin_t *U, const tables_t *T, int64_t n)
+{
+    const double *w = T->w;
+    memset(U, 0, sizeof *U);
+    U->n = n; U->h = (n - 1) / 2;
+    int64_t h = U->h;
+    U->M = xcalloc((size_t)h + 2, sizeof(double));
+    for (int64_t a = 1; a <= h; a++) {
+        int64_t m = n - a;
+        double q = 0.0;
+        for (int64_t b = m - h; b <= h; b++) q += w[b] * w[m - b];
+        U->M[a] = w[a] * q;
+        U->zid += U->M[a];
+    }
+    for (int64_t a = 1; a <= h; a++)
+        if ((n - a) % 2 == 0) { int64_t b = (n - a) / 2; U->ztr += w[a] * w[b] * rho_pow(T, b); }
+    if (n % 3 == 0) U->zcyc = w[n / 3] * rho_pow(T, 2 * n / 3);
+    U->zuni = (U->zid + 3.0 * U->ztr + 2.0 * U->zcyc) / 6.0;
+    if (n % 2 == 0) {
+        double x = w[n / 2];
+        U->zbi_id = 0.5 * x * x;
+        U->zbi_dup = 0.5 * x * rho_pow(T, n / 2);
+    }
+}
+static void ubin_free(ubin_t *U) { free(U->M); memset(U, 0, sizeof *U); }
+
+/* Appends `copies` copies of a uniform binary tree with m leaves at top. */
+static int64_t ubin_append(sampler_t *S, const tables_t *T, int64_t m, int copies, int64_t top)
+{
+    int64_t s = top;
+    top = gen_binary_at(S, T, m, top);
+    int64_t L = top - s;
+    for (int c = 1; c < copies; c++) {
+        memcpy(S->sz + top, S->sz + s, (size_t)L * sizeof(int32_t));
+        top += L;
+    }
+    return top;
+}
+
+static void gen_ubinary(sampler_t *S, const tables_t *T, const ubin_t *U)
+{
+    const double *w = T->w;
+    int64_t n = U->n, h = U->h, top = 0;
+    rng_t *rng = &S->rng;
+    double ztot = U->zuni + U->zbi_id + U->zbi_dup;
+    for (;;) {
+        double t = rng_double(rng) * ztot;
+        S->steps += 1;
+        if (t < U->zbi_id + U->zbi_dup) {           /* centroid edge */
+            int dup = (t >= U->zbi_id);
+            top = gen_binary_at(S, T, n / 2, 0);
+            int64_t s = top;
+            if (dup) { memcpy(S->sz + top, S->sz, (size_t)s * sizeof(int32_t)); top += s; }
+            else top = gen_binary_at(S, T, n / 2, top);
+            S->sz[0] += (int32_t)(top - s);         /* second half below the root of the first */
+            S->top = top;
+            return;
+        }
+        t = (t - U->zbi_id - U->zbi_dup) * 6.0;   /* centroid node: Z(S_3) */
+        S->sz[0] = 0; top = 1;
+        if (t < U->zid) {                           /* identity: ordered triple (a,b,c) */
+            int64_t a;
+            for (a = 1; a <= h; a++) { S->steps++; t -= U->M[a]; if (t < 0.0) break; }
+            if (a > h) continue;                    /* rounding: start again */
+            int64_t m = n - a, b;
+            double u = rng_double(rng) * (U->M[a] / w[a]);
+            for (b = m - h; b <= h; b++) { S->steps++; u -= w[b] * w[m - b]; if (u < 0.0) break; }
+            if (b > h) continue;
+            top = ubin_append(S, T, a, 1, top);
+            top = ubin_append(S, T, b, 1, top);
+            top = ubin_append(S, T, m - b, 1, top);
+        } else if ((t -= U->zid) < 3.0 * U->ztr) {  /* transposition: a + 2b = n */
+            t /= 3.0;
+            int64_t a;
+            for (a = 1; a <= h; a++) {
+                if ((n - a) % 2) continue;
+                S->steps++;
+                int64_t b = (n - a) / 2;
+                t -= w[a] * w[b] * rho_pow(T, b);
+                if (t < 0.0) break;
+            }
+            if (a > h) continue;
+            top = ubin_append(S, T, a, 1, top);
+            top = ubin_append(S, T, (n - a) / 2, 2, top);
+        } else {                                    /* 3-cycle: three copies */
+            if (n % 3) continue;
+            top = ubin_append(S, T, n / 3, 3, top);
+        }
+        S->sz[0] = (int32_t)top;
+        S->top = top;
+        return;
+    }
+}
+
+/* Validation of an unrooted binary tree given in rooted form. */
+static const char *validate_ubinary(int64_t n, const int32_t *sz, int64_t N)
+{
+    if (N < 1 || sz[0] != N) return "inconsistent root size";
+    if (N != 2 * n - 2) return "number of nodes != 2n-2";
+    int64_t leaves = 0;
+    for (int64_t p = 0; p < N; p++) {
+        if (sz[p] < 1 || p + sz[p] > N) return "sz out of bounds";
+        int64_t deg = (p > 0), c;
+        for (c = p + 1; c < p + sz[p]; c += sz[c]) { if (sz[c] < 1) return "sz zero"; deg++; }
+        if (c != p + sz[p]) return "children do not cover the subtree";
+        if (deg == 1) leaves++;
+        else if (deg != 3) return "internal node of degree other than 3";
+    }
+    return leaves == n ? NULL : "number of leaves != n";
 }
 
 static void sample(sampler_t *S, const tables_t *T, int64_t n)
@@ -1185,6 +1318,126 @@ static void test_rootstat(void)
     }
 }
 
+
+/* (f) unrooted binary trees: counts (OEIS A129860), uniformity, validity.
+ * Canonical form of an unrooted tree: rooted canonical identifiers at its
+ * center (one node, or the two endpoints of the central edge). */
+static uint64_t unrooted_key(const int32_t *sz, int64_t N, hcons_t *H)
+{
+    int64_t *par = xmalloc(sizeof(int64_t) * (size_t)N), *deg = xcalloc((size_t)N, sizeof(int64_t));
+    int64_t *stk = xmalloc(sizeof(int64_t) * (size_t)(2 * N + 2)), sp = 0;
+    for (int64_t i = 0; i < N; i++) {
+        while (sp > 0 && stk[2 * sp - 1] <= i) sp--;
+        par[i] = sp ? stk[2 * sp - 2] : -1;
+        if (par[i] >= 0) { deg[i]++; deg[par[i]]++; }
+        stk[2 * sp] = i; stk[2 * sp + 1] = i + sz[i]; sp++;
+    }
+    /* adjacency (CSR) */
+    int64_t *off = xcalloc((size_t)N + 1, sizeof(int64_t)), *adj = xmalloc(sizeof(int64_t) * (size_t)(2 * N)), *fill;
+    for (int64_t i = 0; i < N; i++) off[i + 1] = off[i] + deg[i];
+    fill = xcalloc((size_t)N, sizeof(int64_t));
+    for (int64_t i = 1; i < N; i++) {
+        int64_t p = par[i];
+        adj[off[i] + fill[i]++] = p; adj[off[p] + fill[p]++] = i;
+    }
+    /* center by leaf peeling */
+    int64_t *d2 = xmalloc(sizeof(int64_t) * (size_t)N), *q = xmalloc(sizeof(int64_t) * (size_t)N), qh = 0, qt = 0, left = N;
+    for (int64_t i = 0; i < N; i++) { d2[i] = deg[i]; if (d2[i] <= 1) q[qt++] = i; }
+    while (left > 2) {
+        int64_t qe = qt;
+        for (; qh < qe; qh++) {
+            int64_t v = q[qh]; left--;
+            for (int64_t e = off[v]; e < off[v + 1]; e++) if (--d2[adj[e]] == 1) q[qt++] = adj[e];
+        }
+    }
+    int64_t c1 = q[qh], c2 = (qt - qh == 2) ? q[qh + 1] : -1;
+    if (left == 1) { c1 = q[qt - 1]; c2 = -1; }
+    /* rooted identifiers, iterative post-order from a root excluding one neighbour */
+    uint32_t *cid = xmalloc(sizeof(uint32_t) * (size_t)N), *kids = xmalloc(sizeof(uint32_t) * (size_t)N);
+    int64_t *ord = xmalloc(sizeof(int64_t) * (size_t)N), *pp = xmalloc(sizeof(int64_t) * (size_t)N);
+    uint32_t ids[2];
+    for (int r = 0; r < (c2 >= 0 ? 2 : 1); r++) {
+        int64_t root = r ? c2 : c1, ban = (c2 >= 0) ? (r ? c1 : c2) : -1, no = 0;
+        ord[no++] = root; pp[root] = ban;
+        for (int64_t k = 0; k < no; k++) {
+            int64_t v = ord[k];
+            for (int64_t e = off[v]; e < off[v + 1]; e++) if (adj[e] != pp[v]) { pp[adj[e]] = v; ord[no++] = adj[e]; }
+        }
+        for (int64_t k = no - 1; k >= 0; k--) {
+            int64_t v = ord[k]; uint32_t nk = 0;
+            for (int64_t e = off[v]; e < off[v + 1]; e++) if (adj[e] != pp[v]) kids[nk++] = cid[adj[e]];
+            sort_u32(kids, nk);
+            cid[v] = hc_get(H, kids, nk);
+        }
+        ids[r] = cid[root];
+    }
+    uint64_t key;
+    if (c2 < 0) key = ((uint64_t)1 << 62) | ids[0];
+    else { uint32_t lo = ids[0] < ids[1] ? ids[0] : ids[1], hi = ids[0] ^ ids[1] ^ lo;
+           key = ((uint64_t)2 << 62) | ((uint64_t)lo << 31) | hi; }
+    free(par); free(deg); free(stk); free(off); free(adj); free(fill); free(d2); free(q);
+    free(cid); free(kids); free(ord); free(pp);
+    return key;
+}
+static int cmp_u64(const void *a, const void *b)
+{ uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return (x > y) - (x < y); }
+
+static void test_ubinary(void)
+{
+    printf("(f) Unrooted binary trees (ubinary)\n");
+    static const int64_t A129860[19] = { 1, 1, 1, 1, 2, 2, 4, 6, 11, 18, 37, 66, 135, 265, 552, 1132, 2410, 5098, 11020 };
+    i128 Tb[24]; exact_counts(FAM_BINARY, 22, Tb);
+    int ok = 1;
+    i128 Uex[21];
+    for (int n = 2; n <= 20; n++) {
+        int h = (n - 1) / 2; i128 id = 0, tr = 0, cy = 0, bi = 0;
+        for (int a = 1; a <= h; a++) for (int b = 1; b <= h; b++) { int c = n - a - b; if (c >= 1 && c <= h) id += Tb[a] * Tb[b] * Tb[c]; }
+        for (int a = 1; a <= h; a++) if ((n - a) % 2 == 0) tr += Tb[a] * Tb[(n - a) / 2];
+        if (n % 3 == 0) cy = Tb[n / 3];
+        if (n % 2 == 0) bi = Tb[n / 2] * (Tb[n / 2] + 1) / 2;
+        Uex[n] = (id + 3 * tr + 2 * cy) / 6 + bi;
+        if (Uex[n] != A129860[n - 2]) ok = 0;
+    }
+    CHECK(ok, "centroid decomposition = OEIS A129860 for n = 2..20");
+    const int64_t NS = 200000;
+    for (int n = 6; n <= 12; n++) {
+        tables_t T; tables_build(&T, FAM_BINARY, n, 3000);
+        ubin_t U; ubin_build(&U, &T, n);
+        sampler_t S; sampler_init(&S, FAM_BINARY, n, 99000 + n);
+        hcons_t H; hc_init(&H);
+        uint64_t *keys = xmalloc(sizeof(uint64_t) * (size_t)NS);
+        int64_t invalid = 0;
+        for (int64_t s = 0; s < NS; s++) {
+            gen_ubinary(&S, &T, &U);
+            if (validate_ubinary(n, S.sz, S.top)) invalid++;
+            keys[s] = unrooted_key(S.sz, S.top, &H);
+        }
+        qsort(keys, (size_t)NS, sizeof(uint64_t), cmp_u64);
+        int64_t ncls = (int64_t)Uex[n], seen = 0; double E = (double)NS / (double)ncls, chi2 = 0;
+        for (int64_t i = 0; i < NS;) {
+            int64_t j = i; while (j < NS && keys[j] == keys[i]) j++;
+            seen++; chi2 += ((double)(j - i) - E) * ((double)(j - i) - E) / E; i = j;
+        }
+        chi2 += (double)(ncls - seen) * E;
+        double pval = (ncls > 1) ? gammq(0.5 * (double)(ncls - 1), 0.5 * chi2) : 1.0;
+        CHECK(seen == ncls && invalid == 0 && pval > 1e-4,
+              "ubinary  n=%2d : %4" PRId64 "/%4" PRId64 " classes seen, chi2=%8.2f (df=%" PRId64 "), p=%.3f, invalid=%" PRId64,
+              n, seen, ncls, chi2, ncls - 1, pval, invalid);
+        free(keys); hc_free(&H); sampler_free(&S); ubin_free(&U); tables_free(&T);
+    }
+    int64_t sizes[] = { 2, 3, 4, 5, 17, 100, 1001, 5000 };
+    const char *err = NULL; int64_t bad = 0;
+    for (size_t c = 0; c < sizeof sizes / sizeof sizes[0]; c++) {
+        int64_t n = sizes[c];
+        tables_t T; tables_build(&T, FAM_BINARY, n, 3000);
+        ubin_t U; ubin_build(&U, &T, n);
+        sampler_t S; sampler_init(&S, FAM_BINARY, n, 5150 + c);
+        for (int s = 0; s < 50; s++) { gen_ubinary(&S, &T, &U); const char *e = validate_ubinary(n, S.sz, S.top); if (e) { err = e; bad = n; } }
+        sampler_free(&S); ubin_free(&U); tables_free(&T);
+    }
+    CHECK(!err, "ubinary validity, n = 2..5000 : %s%s", err ? err : "valid", err ? (bad ? "" : "") : "");
+}
+
 static int selftest(void)
 {
     printf("=== polyagen: self-tests ===\n");
@@ -1193,6 +1446,7 @@ static int selftest(void)
     test_valid();
     test_uniform();
     test_rootstat();
+    test_ubinary();
     printf("=== %s (%d failure(s)) ===\n", nfail ? "FAILURE" : "SUCCESS", nfail);
     return nfail ? 1 : 0;
 }
@@ -1203,10 +1457,11 @@ static int selftest(void)
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: polyagen --family polya|hier|identity|binary -n SIZE [--count K]\n"
+        "usage: polyagen --family polya|hier|identity|binary|ubinary -n SIZE [--count K]\n"
         "                [--seed S] [--format parent|brackets|dot|none] [--stats] [--kexact K0]\n"
         "       polyagen --selftest\n"
-        "  -n SIZE       size (nodes for polya/identity, leaves for hier/binary);\n"
+        "  -n SIZE       size (nodes for polya/identity, leaves for hier/binary/ubinary);\n"
+        "                ubinary: unrooted binary trees (n >= 2), O(n^2) precomputation\n"
         "                notation 1e6 accepted\n"
         "  --count K     number of structures (default 1)\n"
         "  --seed S      seed (default 1)\n"
@@ -1227,7 +1482,7 @@ static int64_t parse_size(const char *s)
 
 int main(int argc, char **argv)
 {
-    int fam = -1, fmt = FMT_PARENT, stats = 0;
+    int fam = -1, fmt = FMT_PARENT, stats = 0, unrooted = 0;
     int64_t n = -1, count = 1, K0 = 3000;
     uint64_t seed = 1;
     for (int i = 1; i < argc; i++) {
@@ -1240,6 +1495,7 @@ int main(int argc, char **argv)
             else if (!strcmp(v, "hier") || !strcmp(v, "hierarchies")) fam = FAM_HIER;
             else if (!strcmp(v, "identity")) fam = FAM_IDENTITY;
             else if (!strcmp(v, "binary")) fam = FAM_BINARY;
+            else if (!strcmp(v, "ubinary")) { fam = FAM_BINARY; unrooted = 1; }
             else usage();
         } else if (!strcmp(a, "-n")) n = parse_size(NEXT());
         else if (!strcmp(a, "--count")) count = parse_size(NEXT());
@@ -1256,18 +1512,21 @@ int main(int argc, char **argv)
         } else usage();
 #undef NEXT
     }
-    if (fam < 0 || n < 1 || K0 < 1) usage();
+    if (fam < 0 || n < 1 || K0 < 1 || (unrooted && n < 2)) usage();
+    const char *famname = unrooted ? "ubinary" : FAM_NAME[fam];
 
     double t0 = now_sec();
     tables_t T;
     tables_build(&T, fam, n, K0);
+    ubin_t U; memset(&U, 0, sizeof U);
+    if (unrooted) ubin_build(&U, &T, n);
     double tpre = now_sec() - t0;
     if (T.asym_used && (T.check_reldiff < 0 || T.check_reldiff > 1e-15))
         fprintf(stderr, "polyagen: WARNING: at k=K0=%" PRId64 ", the recurrence and the asymptotic "
                 "expansion differ by %.2e (relative); increase --kexact.\n", T.K, T.check_reldiff);
     if (stats)
         fprintf(stderr, "# family=%s n=%" PRId64 " K0=%" PRId64 " precomputation=%.4fs gap(K0)=%.2e%s\n",
-                FAM_NAME[fam], n, T.K, tpre, T.check_reldiff, T.asym_used ? "" : " (asymptotics not used)");
+                famname, n, T.K, tpre, T.check_reldiff, T.asym_used ? "" : " (asymptotics not used)");
 
     sampler_t S;
     sampler_init(&S, fam, n, seed);
@@ -1278,11 +1537,11 @@ int main(int argc, char **argv)
     for (int64_t c = 0; c < count; c++) {
         S.steps = 0; S.rejections = 0;
         double ts = now_sec();
-        sample(&S, &T, n);
+        if (unrooted) gen_ubinary(&S, &T, &U); else sample(&S, &T, n);
         double dt = now_sec() - ts;
         output_tree(S.sz, S.top, fmt, ostk, c);
         if (stats) {
-            const char *err = validate(fam, n, S.sz, S.top);
+            const char *err = unrooted ? validate_ubinary(n, S.sz, S.top) : validate(fam, n, S.sz, S.top);
             if (err) nbad++;
             double ratio = nlogn > 0 ? (double)S.steps / nlogn : 0.0;
             sum_t += dt; sum_ratio += ratio; sum_rej += (double)S.rejections; sum_nodes += (double)S.top;
@@ -1296,11 +1555,12 @@ int main(int argc, char **argv)
     if (stats && count > 0)
         fprintf(stderr, "# MEAN family=%s n=%" PRId64 " count=%" PRId64 " nodes=%.1f steps/(n ln n)=%.4f"
                 " time=%.6fs invalid=%" PRId64 " precomputation=%.4fs\n",
-                FAM_NAME[fam], n, count, sum_nodes / count, sum_ratio / count, sum_t / count, nbad, tpre);
+                famname, n, count, sum_nodes / count, sum_ratio / count, sum_t / count, nbad, tpre);
     if (stats && fam == FAM_IDENTITY && count > 0)
         fprintf(stderr, "# MEAN rejections=%.2f\n", sum_rej / count);
     free(ostk);
     sampler_free(&S);
     tables_free(&T);
+    ubin_free(&U);
     return 0;
 }

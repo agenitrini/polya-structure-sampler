@@ -1,8 +1,9 @@
 # polyagen — uniform random sampling of Pólya structures
 
+
 A C99 program (no dependency other than `libm`) that draws uniformly at
 random — up to floating-point precision — an unlabelled structure of a given
-size `n`, in one of the following four families:
+size `n`, in one of the following five families:
 
 | family     | structures                                              | size                | OEIS    |
 |------------|---------------------------------------------------------|---------------------|---------|
@@ -10,6 +11,7 @@ size `n`, in one of the following four families:
 | `hier`     | hierarchies (no unary node)                             | number of leaves    | A000669 |
 | `identity` | identity trees (children pairwise non-isomorphic)       | number of nodes     | A004111 |
 | `binary`   | non-plane binary trees (0 or 2 children per node), Wedderburn–Etherington numbers | number of leaves    | A001190 |
+| `ubinary`  | unrooted binary trees (internal nodes of degree 3)      | number of leaves (`n ≥ 2`) | A129860 |
 
 This code accompanies the paper
 
@@ -28,7 +30,7 @@ make bench      # table of measurements (./bench.sh)
 ```
 
 ```
-polyagen --family polya|hier|identity|binary -n SIZE [--count K] [--seed S]
+polyagen --family polya|hier|identity|binary|ubinary -n SIZE [--count K] [--seed S]
          [--format parent|brackets|dot|none] [--stats] [--kexact K0]
 polyagen --selftest
 ```
@@ -152,6 +154,25 @@ For `binary`, `P(d) = d w_d w_{n-d} / (n w_n)` and
 
 The precomputation costs `O(K0² + n)`: about 0.05 s for `n = 10^6`.
 
+### Unrooted binary trees (`ubinary`)
+
+An unrooted binary tree with `n` leaves is rooted at its *leaf centroid*:
+either the unique internal node whose three branches have fewer than `n/2`
+leaves each, or, for `n` even, the unique edge that splits the leaves into
+two halves. The tree is thus a multiset of three rooted binary trees of
+sizes `< n/2` and total size `n`, or a multiset of two rooted binary trees
+of size `n/2`. These multisets are drawn with the cycle index of `S_3`
+(resp. `S_2`): a pair (permutation, sequence of trees fixed by it) is drawn
+uniformly, which makes the multiset uniform (Burnside's lemma), and the
+trees themselves are drawn by the `binary` sampler. The output is the tree
+rooted at the centroid node (or at an endpoint of the centroid edge), with
+`2n-2` nodes.
+
+The exact weights of the ordered triples of sizes `< n/2` require an
+`O(n²)` precomputation, done once for all the samples of a given size:
+about 0.7 s for `n = 10^5` and 6 s for `n = 3·10^5` on an Apple M4 Pro.
+The generation itself costs the same as for `binary`.
+
 ### Uniformity: up to floating-point precision
 
 The probabilities are handled as `double` (53-bit draw of `U`, successive
@@ -187,6 +208,12 @@ arithmetic*, TCS 1999); this is not implemented here.
 5. **(e)** root statistic at `n = 25` (exact probability of a unary root, of
    a binary root for hierarchies, and for `binary` of a root split into
    `{1, n-1}`, i.e. `T_24/T_25`): deviation < 4.5 standard deviations.
+
+6. **(f)** `ubinary`: the centroid decomposition gives the OEIS terms of
+   A129860 for `n = 2..20`; uniformity (2·10^5 samples, chi-squared test,
+   canonical forms computed at the centre of the tree) for `n = 6..12`
+   (e.g. 11 trees for `n = 10`, 37 for `n = 12`); validity (`n` leaves,
+   `2n-2` nodes, internal degree 3) for `n` from 2 to 5000.
 
 Result: **all tests pass** (chi-squared p-values between 0.08 and 0.92;
 total running time ≈ 3 s).
